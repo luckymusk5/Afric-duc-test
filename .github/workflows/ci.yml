@@ -3,6 +3,15 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings
+      PYTHONPATH: backend
+      DEBUG: "1"
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: passage
+      POSTGRES_USER: passage
+      POSTGRES_PASSWORD: passage
+      BADGE_SECRET_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
     services:
       postgres:
         image: postgres:16
@@ -20,6 +29,5 @@ jobs:
         with: {python-version: '3.12'}
       - run: pip install -r backend/requirements.txt
       - run: python backend/manage.py makemigrations passage --check --dry-run --noinput
-        env: {DJANGO_SETTINGS_MODULE: config.settings, PYTHONPATH: backend, DEBUG: "1", POSTGRES_HOST: localhost, POSTGRES_DB: passage, POSTGRES_USER: passage, POSTGRES_PASSWORD: passage}
-      - run: python backend/manage.py test passage
-        env: {DJANGO_SETTINGS_MODULE: config.settings, PYTHONPATH: backend, DEBUG: "1", POSTGRES_HOST: localhost, POSTGRES_DB: passage, POSTGRES_USER: passage, POSTGRES_PASSWORD: passage}
+      - name: Run rotating student QR security tests
+        run: python backend/manage.py test passage.test_badge_security
