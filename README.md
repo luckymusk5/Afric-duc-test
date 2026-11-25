@@ -20,7 +20,7 @@ docker compose up --build
 
 Avant la première migration des badges, génère `BADGE_SECRET_KEY` comme clé URL-safe de 32 octets et garde-la sauvegardée: sous PowerShell, exécute `[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_')`, puis colle le résultat dans `.env`. Ne régénère pas cette clé tant que les badges chiffrés par l’ancienne valeur sont utilisés.
 
-L’application web est sur http://localhost:5173, l’API sur http://localhost:8000/api et RabbitMQ Management sur http://localhost:15672. Les migrations versionnées dans le dépôt sont appliquées au démarrage, puis un jeu de données local est ajouté; le worker Celery consomme la file durable `scan_sync`. Les identifiants Management sont ceux de `RABBITMQ_DEFAULT_USER` et `RABBITMQ_DEFAULT_PASS` dans `.env`. Les évolutions doivent ensuite être livrées comme migrations versionnées.
+L’application web est sur http://localhost:5173, la page élève « Votre PaSS » sur http://localhost:5173/eleve, l’API sur http://localhost:8000/api et ses endpoints REST sont visibles à http://localhost:8000/api/. RabbitMQ Management est sur http://localhost:15672. Les migrations versionnées dans le dépôt sont appliquées au démarrage, puis un jeu de données local est ajouté; le worker Celery consomme la file durable `scan_sync`. Les identifiants Management sont ceux de `RABBITMQ_DEFAULT_USER` et `RABBITMQ_DEFAULT_PASS` dans `.env`. Les évolutions doivent ensuite être livrées comme migrations versionnées.
 
 Comptes de démonstration (mot de passe identique à l’identifiant de rôle + `Pass123!`):
 
