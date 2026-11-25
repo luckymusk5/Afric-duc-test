@@ -1,81 +1,142 @@
 # Afric’Éduc — SchoolLogs Passage
 
-MVP du module de suivi des passages d’élèves par badge, avec file hors ligne, API à rôles, anomalies et synthèse assistée.
+Application de suivi des passages par QR tournant, avec API Django, interface React et file locale IndexedDB. L’appareil de portail ne choisit ni élève, ni point de contrôle, ni direction : le serveur les déduit du badge et de l’affectation authentifiée du terminal.
 
-## Stack retenue
+## Stack
 
-- **Django + Django REST Framework** : API métier et permissions serveur.
-- **React + Vite** : interface portail responsive avec file locale persistante.
-- **PostgreSQL** : stockage relationnel, accusés de réception de synchronisation et contraintes d’idempotence.
-- **RabbitMQ + Celery** : file durable et worker asynchrone pour écrire les passages en base après reconnexion.
-- **Docker Compose** : environnement local reproductible avec RabbitMQ Management.
+- Django, Django REST Framework et PostgreSQL.
+- React et Vite.
+- IndexedDB, `jsQR` et Service Worker natif pour le mode hors ligne.
+- APScheduler dans un conteneur séparé pour clôturer les fenêtres.
+- Aucun broker ni worker de file externe.
 
-## Démarrage
+## Configuration et démarrage
+
+Copier le modèle puis renseigner les secrets et mots de passe locaux dans `.env` :
 
 ```powershell
-if (!(Test-Path .env)) { Copy-Item .env.example .env }
-# Génère BADGE_SECRET_KEY avec la commande ci-dessous, puis démarre les services.
+Copy-Item .env.example .env
+[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_')
+```
+
+La première commande génère une clé Django; la seconde une clé URL-safe de 32 octets pour chiffrer les secrets de badge. Définir aussi un mot de passe PostgreSQL et les quatre mots de passe `DEMO_*_PASSWORD`. Ne jamais copier ces valeurs dans le dépôt. `.env` est ignoré par Git.
+
+Lancer les conteneurs :
+
+```powershell
 docker compose up --build
 ```
 
-Avant la première migration des badges, génère `BADGE_SECRET_KEY` comme clé URL-safe de 32 octets et garde-la sauvegardée: sous PowerShell, exécute `[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_')`, puis colle le résultat dans `.env`. Ne régénère pas cette clé tant que les badges chiffrés par l’ancienne valeur sont utilisés.
+L’interface est sur http://localhost:5173 et l’API sur http://localhost:8000/api. Le conteneur backend applique les migrations et exécute `seed_demo`; le conteneur `scheduler` clôture les fenêtres avec le délai `PASSAGE_GRACE_MINUTES`.
 
-L’application web est sur http://localhost:5173, la page élève « Votre PaSS » sur http://localhost:5173/eleve, l’API sur http://localhost:8000/api et ses endpoints REST sont visibles à http://localhost:8000/api/. RabbitMQ Management est sur http://localhost:15672. Les migrations versionnées dans le dépôt sont appliquées au démarrage, puis un jeu de données local est ajouté; le worker Celery consomme la file durable `scan_sync`. Les identifiants Management sont ceux de `RABBITMQ_DEFAULT_USER` et `RABBITMQ_DEFAULT_PASS` dans `.env`. Les évolutions doivent ensuite être livrées comme migrations versionnées.
+Pour lancer le frontend sans Docker : `Set-Location frontend; npm ci; npm run dev`. Pour le backend seul, renseigner `POSTGRES_HOST=localhost`, puis lancer `python manage.py migrate`, `python manage.py seed_demo` et `python manage.py runserver` dans `backend`.
 
-Comptes de démonstration (mot de passe identique à l’identifiant de rôle + `Pass123!`):
+## Enrôlement et usage du portail
 
-- `admin@afric-educ.test` / `AdminPass123!`
-- `agent@afric-educ.test` / `AgentPass123!`
-- `parent1@afric-educ.test` / `ParentPass123!`
-- `parent2@afric-educ.test` / `ParentPass123!`
+1. Connectez-vous comme responsable sur le navigateur du terminal.
+2. Créez ou sélectionnez le point de contrôle puis choisissez **Enrôler le terminal pour ce portail**. Le secret d’appareil est conservé dans IndexedDB et n’est affiché qu’une fois par la réponse d’enrôlement.
+3. Déconnectez-vous, connectez-vous comme agent sur le même navigateur et ouvrez l’écran de scan.
+4. L’agent scanne le badge; le passage est écrit dans IndexedDB avant tout envoi. À la reconnexion, les événements acquittés sont supprimés localement.
 
-## Lancement du backend sans Docker (Windows CMD)
+**Avant le premier usage hors ligne, ouvrir l’application une fois en ligne** afin de mettre en cache la coquille de l’écran de scan. La caméra, le Service Worker et `crypto.randomUUID()` exigent **HTTPS ou localhost**. Une calibration serveur est requise avant le premier scan; chaque réponse serveur recale ensuite l’horloge monotone. Le QR de l’élève utilise aussi l’heure serveur et son badge déjà chargé reste disponible hors ligne.
 
-Le fichier `.env` à la racine est chargé automatiquement par Django. Renseigne-y tes paramètres PostgreSQL locaux, puis démarre PostgreSQL. Dans `backend` :
+Le navigateur affiche uniquement l’état réseau, le nombre d’événements en attente et les retours du scan en cours. Les refus tardifs de la synchronisation ne sont pas affichés à l’agent. La mise à jour du Service Worker est contrôlée par le bouton **Mettre à jour**.
 
-```cmd
-python manage.py makemigrations passage
-python manage.py migrate
-python manage.py seed_demo
-python manage.py runserver
+## QR personnel de l’élève
+
+Après connexion, chaque élève authentifié récupère uniquement son propre badge actif via `GET /api/my/badge/`. Le secret du badge est conservé chiffré en base; le navigateur reçoit le secret nécessaire au calcul du QR et le met en cache dans IndexedDB pour l’affichage hors ligne. L’heure renvoyée par l’API sert à estimer l’heure serveur, même si l’horloge locale dérive.
+
+Le QR est généré dans le navigateur et dessiné en SVG par le composant local `QrSvg` (sans bibliothèque QR externe). Son contenu est `badge_id.counter.signature`; la signature est un HMAC-SHA-256 tronqué à 16 octets. Le compteur change toutes les **15 secondes**, ce qui renouvelle le code présenté par l’élève.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Eleve as Élève
+    participant Web as Interface React
+    participant API as API Django
+    participant DB as PostgreSQL
+    participant Local as IndexedDB
+    participant Agent as Scanner de l'agent
+
+    Eleve->>Web: Saisit ses identifiants
+    Web->>API: POST /api/auth/login/
+    API->>DB: Vérifie le compte
+    DB-->>API: Compte et rôle
+    API-->>Web: Jetons d'accès et de rafraîchissement
+
+    Web->>API: GET /api/my/badge/ (authentifié)
+    API->>API: Vérifie le rôle élève et le compte actif
+    API->>DB: Cherche le badge actif de cet élève
+    DB-->>API: Identifiant et secret chiffré du badge
+    API->>API: Déchiffre le secret du badge
+    API-->>Web: badge_id, secret, server_time
+    Web->>Local: Met en cache le badge et l'heure serveur
+
+    loop Tant que la page élève est ouverte
+        Web->>Web: Estime l'heure serveur et calcule floor(temps / 15)
+        alt Le compteur de 15 secondes change
+            Web->>Web: Calcule HMAC-SHA-256(badge_id.counter)
+            Web->>Web: Affiche le nouveau QR en SVG
+        else Le compteur n'a pas changé
+            Web->>Web: Garde le QR courant
+        end
+    end
+
+    Eleve-->>Agent: Présente le QR
+    Agent->>Agent: Scanne le badge et crée un événement identifié
+    Agent->>Local: Enregistre le passage avant l'envoi réseau
+    opt Le réseau est indisponible
+        Note over Agent,Local: L'événement reste dans la file locale
+    end
+    Agent->>API: POST /api/passages/sync (session, CSRF, jeton appareil)
+    API->>DB: Vérifie l'appareil et verrouille le traitement du lot
+    API->>DB: Vérifie l'identifiant d'événement et l'affectation du terminal
+    API->>DB: Vérifie le badge, sa signature et son compteur temporel
+    alt QR valide, badge actif, passage non déjà utilisé
+        API->>DB: Enregistre Scan et BadgeUsage dans la transaction
+        Note over DB: Unicité de (badge, counter) contre le rejeu du QR
+    else QR invalide, badge inactif ou créneau déjà consommé
+        API->>DB: Enregistre le passage comme refusé
+    end
+    API-->>Agent: Accusés de réception et server_time
+    Agent->>Local: Supprime uniquement les événements acquittés
 ```
 
-`POSTGRES_HOST=localhost` est utilisé pour ce lancement direct. Avec Docker Compose, le conteneur backend rejoint PostgreSQL via le nom de service `db`.
+Le scanner conserve ses événements dans IndexedDB sans réseau, puis les envoie au retour de la connexion. Le serveur déduplique les renvois avec `(device_id, event_id)` et interdit de consommer deux fois le même QR avec `(badge, counter)`. Le point de contrôle et la direction du passage sont déterminés côté serveur.
+
+À la réception, le backend recalcule la signature, vérifie que le badge et l’élève sont actifs et contrôle la fenêtre temporelle du compteur. Les quatre tests ciblés couvrent la falsification de signature, un compteur hors fenêtre, un badge inactif, le rejeu d’un QR et l’accès aux identifiants par le compte élève concerné. La GitHub Action lance ces tests et vérifie l’état des migrations.
 
 ## API principale
 
-- `POST /api/auth/login/`, `POST /api/auth/refresh/`, `POST /api/auth/logout/`
-- `GET /api/me/`
-- `GET /api/students/` (admin et parent; portée filtrée côté serveur)
-- `POST /api/students/{id}/badges/reissue/` (admin; émet une fois le secret d’enrôlement)
-- `GET /api/badges/` et `PATCH /api/badges/{uuid}/state/` (admin; gestion du cycle de vie)
-- `POST /api/devices/time-sync/` (agent ou responsable; calibre l’horloge d’un terminal)
-- `POST /api/scans/sync/` (agent ou responsable; confirme la publication durable dans RabbitMQ)
-- `GET /api/scans/sync/status/?eventIds=uuid,...` (état du traitement jusqu’à l’écriture PostgreSQL)
-- `GET /api/scans/`, `GET /api/anomalies/`, `GET /api/outbox/`
-- `GET /api/summaries/daily/?class=6e%20A&date=YYYY-MM-DD` (responsable)
-- `POST /api/anomalies/close-windows/` (à déclencher par un ordonnanceur)
+- `POST /api/auth/login/` et `POST /api/auth/session/` : authentification JWT et session protégée par CSRF.
+- `POST /api/devices/` : enrôlement d’un terminal par un responsable; `POST /api/devices/{uuid}/assign/` enregistre une réaffectation datée.
+- `POST /api/devices/time-sync/` : calibration de l’horloge du terminal enrôlé.
+- `GET /api/my/badge/` : identifiants QR du badge actif de l’élève connecté uniquement.
+- `POST /api/passages/sync` : lot transactionnel d’au plus 100 événements, accessible à un agent authentifié par session/CSRF et secret d’appareil.
+- `GET /api/students/`, `GET /api/scans/`, `GET /api/anomalies/` et `GET /api/outbox/` : ressources filtrées selon le rôle.
+- `GET /api/anomalies/non-treated-count/` : compteur des anomalies ouvertes ou provisoires pour le responsable.
+- `POST /api/anomalies/close-windows/` : clôture manuelle; en production, le scheduler l’exécute périodiquement.
 
-## Sécurité
+La synchronisation répond avec `{acks, server_time}`. Chaque accusé identifie l’événement et son résultat générique; aucune identité d’élève ni motif de refus n’est renvoyé par cette route. Les clés uniques `(device_id, event_id)` et `(badge, counter)` protègent respectivement contre le renvoi technique et le rejeu du QR.
 
-Les mots de passe sont hachés par Django (PBKDF2 par défaut). Chaque badge possède un UUID aléatoire sans donnée élève et un secret aléatoire de 256 bits. Le secret est chiffré en base par AES-256-GCM avec un nonce aléatoire et l’UUID comme donnée associée; la clé `BADGE_SECRET_KEY` doit être une clé Base64 URL-safe de 32 octets, conservée hors base. La migration `0003` chiffre les anciens secrets: définir cette même clé avant `migrate`, la sauvegarder et la conserver pour les futures lectures; une perte de clé empêche de valider les badges. Le secret d’enrôlement n’est renvoyé qu’une fois lors de l’émission/remplacement, puis le navigateur élève le conserve localement et ne l’affiche plus. Le QR tournant comprend UUID, compteur de 30 secondes et HMAC-SHA256 tronqué à 128 bits; il ne contient pas l’identité. Le format est volontairement spécifique au projet et utilise SHA-256, tandis que le test RFC 6238 vérifie séparément le vecteur normatif TOTP-SHA1. Les compteurs consommés ont une contrainte unique en base: réutiliser un code pour un autre événement échoue même si deux workers traitent en parallèle. Les réponses de refus des badges sont génériques et les tentatives sont limitées à 60 par terminal et par minute. Les jetons ont une tolérance de compteur d’environ une minute autour de l’heure estimée; une file hors ligne très ancienne peut donc être rejetée. Une horloge monotone du navigateur sert à estimer l’heure après calibration. Après redémarrage/rechargement, le terminal doit se recalibrer en ligne. Les identifiants d’appareil stockés côté navigateur ne constituent pas une identité matérielle inviolable. TLS, sauvegarde/rotation organisée de la clé et enrôlement/authentification matériel des terminaux sont nécessaires avant production.
+## Commandes de gestion
 
-## Hors ligne et anomalies
-
-Le navigateur agent conserve chaque scan avec UUID dans localStorage tant que l’API ne confirme pas son dépôt dans RabbitMQ. À la reconnexion, Django vérifie le badge et persiste un reçu PostgreSQL avant publication. RabbitMQ utilise une file quorum durable, des messages persistants et les publisher confirms; le worker Celery acquitte après traitement et réessaie les erreurs transitoires. L’interface interroge le statut jusqu’à l’écriture PostgreSQL. La contrainte unique sur `event_id` rend la livraison idempotente. L’heure du scan est construite depuis l’ancre serveur et `performance.now()`; le terminal garde aussi son heure civile déclarée. Une dérive supérieure à cinq minutes est signalée. Un jeton authentique peut encore être copié et relayé en direct avant sa première utilisation: rotation courte et anti-rejeu n’empêchent pas à eux seuls ce relais. Un PIN/NFC ou un protocole défi-réponse avec terminal authentifié serait nécessaire pour le bloquer.
-
-## Synthèse IA
-
-Le backend calcule les compteurs, puis fournit au modèle uniquement ces agrégats. La réponse est contrainte au JSON `{"text":"..."}`, la phrase est bornée et ses chiffres sont comparés aux faits fournis. Une tentative est renouvelée une fois puis le gabarit exact est utilisé. `AI_API_KEY`, `AI_API_URL`, `AI_MODEL` et `AI_MONTHLY_BUDGET` configurent l’intégration. Une synthèse calculée est cachée par empreinte pour éviter une double facturation. Le plafond atteint ou l’indisponibilité du fournisseur est renvoyé avec un motif lisible. Chaque appel et tentative est journalisé dans `AIUsageLog` avec modèle, volume estimé, coût et résultat; le coût estimé et le modèle sont aussi stockés avec la synthèse. Sans clé, le gabarit fonctionne.
-
-## Tests et CI
-
-```bash
-docker compose exec backend python manage.py test passage
+```powershell
+python manage.py migrate
+python manage.py seed_demo
+python manage.py run_scheduler
+python manage.py rebuild_journal 2026-11-25
 ```
 
-GitHub Actions démarre PostgreSQL et exécute les tests API/métier à chaque push et pull request. Les tests de synchronisation vérifient le statut en file et le maintien du reçu quand la publication échoue.
+`seed_demo` est idempotente et requiert les mots de passe de démonstration définis dans l’environnement. `rebuild_journal` reconstruit le journal local depuis les passages acceptés.
 
-## Limites à terminer
+## Vérifications
 
-Voir [DECISIONS.md](DECISIONS.md) pour le raisonnement sécurité détaillé et les limites de la solution.
+```powershell
+python manage.py test passage
+python manage.py makemigrations passage --check --dry-run --noinput
+Set-Location frontend; npm run build
+```
+
+La GitHub Action démarre PostgreSQL, vérifie les migrations et lance les tests de sécurité prioritaires du QR élève.
