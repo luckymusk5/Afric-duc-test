@@ -1,0 +1,76 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-schoollogs}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local-rabbit-change-me}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-passage}
+      POSTGRES_USER: ${POSTGRES_USER:-passage}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-passage-local}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-passage} -d ${POSTGRES_DB:-passage}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  backend:
+    build: ./backend
+    environment:
+      POSTGRES_HOST: db
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-schoollogs}:${RABBITMQ_DEFAULT_PASS:-local-rabbit-change-me}@rabbitmq:5672//
+      POSTGRES_DB: ${POSTGRES_DB:-passage}
+      POSTGRES_USER: ${POSTGRES_USER:-passage}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-passage-local}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-local-only-change-me}
+      BADGE_SIGNING_KEY: ${BADGE_SIGNING_KEY:-local-badge-key-change-me}
+      DEBUG: ${DEBUG:-1}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_API_URL: ${AI_API_URL:-}
+      AI_MODEL: ${AI_MODEL:-gpt-4o-mini}
+      AI_MONTHLY_BUDGET: ${AI_MONTHLY_BUDGET:-2}
+      MAX_DAILY_MESSAGES: ${MAX_DAILY_MESSAGES:-5}
+    ports: ["8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+  celery:
+    build: ./backend
+    command: ["celery", "-A", "config", "worker", "--loglevel=info", "-Q", "scan_sync", "--concurrency=2"]
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-passage}
+      POSTGRES_USER: ${POSTGRES_USER:-passage}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-passage-local}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-local-only-change-me}
+      BADGE_SIGNING_KEY: ${BADGE_SIGNING_KEY:-local-badge-key-change-me}
+      DEBUG: ${DEBUG:-1}
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-schoollogs}:${RABBITMQ_DEFAULT_PASS:-local-rabbit-change-me}@rabbitmq:5672//
+      MAX_DAILY_MESSAGES: ${MAX_DAILY_MESSAGES:-5}
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+  frontend:
+    build: ./frontend
+    ports: ["5173:5173"]
+    depends_on: [backend]
+volumes:
+  postgres_data:
+  rabbitmq_data:
