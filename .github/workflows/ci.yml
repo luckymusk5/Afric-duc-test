@@ -1,0 +1,41 @@
+name: Student QR security
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: passage
+          POSTGRES_USER: passage
+          POSTGRES_PASSWORD: passage
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U passage -d passage"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install -r backend/requirements.txt
+      - name: Check model migrations
+        run: python backend/manage.py makemigrations passage --check --dry-run --noinput
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings
+          PYTHONPATH: backend
+          DEBUG: "1"
+          POSTGRES_HOST: localhost
+          POSTGRES_DB: passage
+          POSTGRES_USER: passage
+          POSTGRES_PASSWORD: passage
+      - name: Run student QR security tests
+        run: python backend/manage.py test passage.test_badge_security
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings
+          PYTHONPATH: backend
+          DEBUG: "1"
+          POSTGRES_HOST: localhost
+          POSTGRES_DB: passage
+          POSTGRES_USER: passage
+          POSTGRES_PASSWORD: passage
