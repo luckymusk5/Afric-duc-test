@@ -2,6 +2,7 @@ from celery import shared_task,Task
 from django.db import OperationalError,DatabaseError
 from .models import SyncReceipt
 from .services import accept_scan
+from .badge_security import BadgeRejected
 class ScanTask(Task):
     autoretry_for=(OperationalError,DatabaseError)
     retry_backoff=True
@@ -11,7 +12,7 @@ class ScanTask(Task):
     reject_on_worker_lost=True
     def on_failure(self,exc,task_id,args,kwargs,einfo):
         if args:
-            SyncReceipt.objects.filter(event_id=args[0],state__in=['queued','processing']).update(state='failed',error='Échec après plusieurs tentatives.')
+            SyncReceipt.objects.filter(event_id=args[0],state__in=['queued','processing']).update(state='failed',error='Échec après plusieurs tentatives.',payload={})
         super().on_failure(exc,task_id,args,kwargs,einfo)
 @shared_task(bind=True,base=ScanTask,name='passage.process_scan')
 def process_scan(self,event_id):
@@ -19,16 +20,16 @@ def process_scan(self,event_id):
     if receipt is None or receipt.state=='processed':return
     receipt.state='processing';receipt.error='';receipt.save(update_fields=['state','error','updated_at'])
     try:
-        result=accept_scan(receipt.payload,prevalidated=True)
+        result=accept_scan(receipt.payload,count_attempt=False)
         if result.get('rejected'):
             receipt.state='rejected';receipt.error=result['rejected']
         else:
             receipt.state='processed';receipt.payload={}
         receipt.save(update_fields=['state','error','payload','updated_at'])
         return result
-    except ValueError as exc:
-        receipt.state='rejected';receipt.error=str(exc)[:250]
-        receipt.save(update_fields=['state','error','updated_at'])
+    except BadgeRejected:
+        receipt.state='rejected';receipt.error='Badge refusé';receipt.payload={}
+        receipt.save(update_fields=['state','error','payload','updated_at'])
         return {'rejected':receipt.error}
     except Exception as exc:
         receipt.state='queued';receipt.error='Nouvelle tentative de synchronisation.'

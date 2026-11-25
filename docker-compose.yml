@@ -38,7 +38,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-passage}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-passage-local}
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-local-only-change-me}
-      BADGE_SIGNING_KEY: ${BADGE_SIGNING_KEY:-local-badge-key-change-me}
+      BADGE_SECRET_KEY: ${BADGE_SECRET_KEY:-}
       DEBUG: ${DEBUG:-1}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_API_URL: ${AI_API_URL:-}
@@ -58,7 +58,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-passage}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-passage-local}
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-local-only-change-me}
-      BADGE_SIGNING_KEY: ${BADGE_SIGNING_KEY:-local-badge-key-change-me}
+      BADGE_SECRET_KEY: ${BADGE_SECRET_KEY:-}
       DEBUG: ${DEBUG:-1}
       RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-schoollogs}:${RABBITMQ_DEFAULT_PASS:-local-rabbit-change-me}@rabbitmq:5672//
       MAX_DAILY_MESSAGES: ${MAX_DAILY_MESSAGES:-5}

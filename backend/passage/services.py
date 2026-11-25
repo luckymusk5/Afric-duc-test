@@ -3,57 +3,92 @@ from datetime import timedelta, datetime
 from django.conf import settings
 from django.db import transaction,IntegrityError
 from django.utils import timezone
-from .models import Badge,Scan,Anomaly,RouteWindow,Student,AISummary,AIUsageLog
+from .models import Badge, BadgeUsage, Scan, Anomaly, RouteWindow, Student, AISummary, AIUsageLog, DeviceClock, Checkpoint
+from .badge_security import BadgeRejected, validate_rotating_token, record_device_attempt
 from .notifications import notification_gateway
 
-def badge_token(badge, now=None):
-    slot=int((now or time.time())//60); payload=f'{badge.pk}.{slot}'
-    key=os.getenv('BADGE_SIGNING_KEY',settings.SECRET_KEY).encode()
-    return payload+'.'+hmac.new(key,payload.encode(),hashlib.sha256).hexdigest()
-def verify_token(token, now=None, allow_expired=False):
-    try:
-        badge_id,slot,sig=token.split('.'); slot=int(slot)
-        if not allow_expired and abs(int((now or time.time())//60)-slot)>1:return None
-        payload=f'{badge_id}.{slot}'; key=os.getenv('BADGE_SIGNING_KEY',settings.SECRET_KEY).encode()
-        if not hmac.compare_digest(sig,hmac.new(key,payload.encode(),hashlib.sha256).hexdigest()):return None
-        return Badge.objects.select_related('student').get(pk=int(badge_id),state='active',student__active=True)
-    except Exception:return None
 def create_anomaly(student,kind,when,scan=None,details=''):
     anomaly,created=Anomaly.objects.get_or_create(student=student,kind=kind,occurred_at=when,scan=scan,defaults={'details':details})
     if not created:return anomaly
     for parent in student.parents.all():notification_gateway.queue(parent,anomaly)
     return anomaly
-def accept_scan(data, prevalidated=False):
-    badge=verify_token(data['token'],allow_expired=prevalidated)
-    if not badge: raise ValueError('Badge invalide ou expiré')
-    now=timezone.now(); local=data['localTime']
-    if isinstance(local,str):
+def _scan_datetime(value):
+    if isinstance(value, str):
         from django.utils.dateparse import parse_datetime
-        local=parse_datetime(local)
-        if local is None:raise ValueError('Heure locale invalide')
-        if timezone.is_naive(local):local=timezone.make_aware(local,timezone.get_current_timezone())
-    skew=abs((now-local).total_seconds())>300
-    with transaction.atomic():
-        old=Scan.objects.filter(event_id=data['eventId']).first()
-        if old:return {'id':old.id,'duplicate':True,'clockSkew':False}
-        if Scan.objects.filter(token=data['token']).exists():
-            create_anomaly(badge.student,'badge_replay',now,None,'Code tournant déjà utilisé')
-            return {'rejected':'Code déjà utilisé'}
-        checkpoint_id=data['checkpointId']
-        try: window=RouteWindow.objects.get(student=badge.student,checkpoint_id=checkpoint_id)
-        except RouteWindow.DoesNotExist: window=None
-        scan=Scan.objects.create(event_id=data['eventId'],badge=badge,checkpoint_id=checkpoint_id,local_time=local,device_id=data['deviceId'],clock_skew=skew,token=data['token'])
-        if skew:create_anomaly(badge.student,'horloge_appareil',now,scan,'Heure locale écartée; heure serveur utilisée')
-        if not window:create_anomaly(badge.student,'point_inattendu',now,scan,'Point absent de l’itinéraire')
-        elif not(window.start_time<=timezone.localtime(now).time().replace(tzinfo=None)<=window.end_time):create_anomaly(badge.student,'hors_fenetre',now,scan,'Validation hors fenêtre')
-        if Scan.objects.filter(badge=badge,received_at__gte=now-timedelta(seconds=60)).exclude(pk=scan.pk).exists():create_anomaly(badge.student,'double_scan',now,scan,'Scans rapprochés de moins de 60 secondes')
-        return {'id':scan.id,'duplicate':False,'clockSkew':skew}
+        value = parse_datetime(value)
+    if value is None:
+        raise BadgeRejected
+    if timezone.is_naive(value):
+        value = timezone.make_aware(value, timezone.get_current_timezone())
+    return value
+
+def accept_scan(data, now=None, count_attempt=True):
+    now = now or timezone.now()
+    token = data.get('token')
+    event_id = data.get('eventId', data.get('event_id'))
+    local_time = _scan_datetime(data.get('localTime', data.get('local_time')))
+    estimated_time = _scan_datetime(data.get('estimatedTime', data.get('estimated_time')))
+    device_id = str(data.get('deviceId', data.get('device_id', '')))[:100]
+    checkpoint_id = data.get('checkpointId', data.get('checkpoint_id'))
+    if not event_id or not device_id or not checkpoint_id or not token:
+        raise BadgeRejected
+    device_clock = DeviceClock.objects.filter(device_id=device_id).first()
+    if device_clock is None:
+        raise BadgeRejected
+    if count_attempt and not record_device_attempt(device_id, now=now):
+        raise BadgeRejected
+    badge, counter = validate_rotating_token(token, estimated_time, now=now)
+    submitted_offset = float(data.get('clockOffsetSeconds', data.get('clock_offset_seconds', device_clock.offset_seconds)))
+    stale_anchor = (now - device_clock.synchronized_at).total_seconds() > 24 * 60 * 60
+    offset_changed = abs(submitted_offset - device_clock.offset_seconds) > 300
+    clock_suspect = (
+        abs((local_time - estimated_time).total_seconds() + device_clock.offset_seconds) > 300
+        or stale_anchor
+        or offset_changed
+    )
+    try:
+        with transaction.atomic():
+            existing = Scan.objects.filter(event_id=event_id).first()
+            if existing:
+                return {'id': existing.id, 'duplicate': True, 'clockSuspect': existing.clock_suspect}
+            checkpoint = Checkpoint.objects.get(pk=checkpoint_id)
+            scan = Scan.objects.create(
+                event_id=event_id,
+                badge=badge,
+                checkpoint=checkpoint,
+                local_time=local_time,
+                estimated_time=estimated_time,
+                device_id=device_id,
+                clock_offset_seconds=device_clock.offset_seconds,
+                clock_suspect=clock_suspect,
+            )
+            BadgeUsage.objects.create(badge=badge, counter=counter, scan=scan)
+    except IntegrityError:
+        existing = Scan.objects.filter(event_id=event_id).first()
+        if existing:
+            return {'id': existing.id, 'duplicate': True, 'clockSuspect': existing.clock_suspect}
+        raise BadgeRejected from None
+    except Checkpoint.DoesNotExist:
+        raise BadgeRejected from None
+    if clock_suspect:
+        create_anomaly(badge.student, 'horloge_appareil', estimated_time, scan, 'Décalage de l’horloge de l’appareil supérieur à cinq minutes.')
+    window = RouteWindow.objects.filter(student=badge.student, checkpoint=checkpoint).first()
+    if not window:
+        create_anomaly(badge.student, 'point_inattendu', estimated_time, scan, 'Point absent de l’itinéraire')
+    elif not (window.start_time <= timezone.localtime(estimated_time).time().replace(tzinfo=None) <= window.end_time):
+        create_anomaly(badge.student, 'hors_fenetre', estimated_time, scan, 'Validation hors fenêtre')
+    if Scan.objects.filter(
+        badge=badge,
+        estimated_time__range=(estimated_time - timedelta(seconds=60), estimated_time + timedelta(seconds=60)),
+    ).exclude(pk=scan.pk).exists():
+        create_anomaly(badge.student, 'double_scan', estimated_time, scan, 'Scans rapprochés de moins de 60 secondes')
+    return {'id': scan.id, 'duplicate': False, 'clockSuspect': clock_suspect}
 def close_windows(now=None):
     now=now or timezone.now(); local=timezone.localtime(now); count=0
     windows=RouteWindow.objects.filter(days__contains=[local.isoweekday()],end_time__lt=local.time())
     for w in windows.select_related('student','checkpoint'):
         badge=Badge.objects.filter(student=w.student,state='active').first()
-        if badge and not Scan.objects.filter(badge=badge,checkpoint=w.checkpoint,received_at__date=local.date()).exists():
+        if badge and not Scan.objects.filter(badge=badge,checkpoint=w.checkpoint,estimated_time__date=local.date()).exists():
             occurrence=timezone.make_aware(datetime.combine(local.date(),w.end_time),timezone.get_current_timezone())
             before=Anomaly.objects.filter(student=w.student,kind='passage_manquant',occurred_at=occurrence,details=str(w.pk)).exists()
             create_anomaly(w.student,'passage_manquant',occurrence,None,str(w.pk))
@@ -61,8 +96,8 @@ def close_windows(now=None):
     return count
 def summary_stats(class_name,day):
     qs=Student.objects.filter(class_name=class_name,active=True); total=qs.count()
-    scans=Scan.objects.filter(badge__student__in=qs,received_at__date=day,checkpoint_id=1)
-    arrived=scans.values('badge__student_id').distinct().count(); late=scans.filter(received_at__time__gt='07:45:00').values('badge__student_id').distinct().count()
+    scans=Scan.objects.filter(badge__student__in=qs,estimated_time__date=day,checkpoint_id=1)
+    arrived=scans.values('badge__student_id').distinct().count(); late=scans.filter(estimated_time__time__gt='07:45:00').values('badge__student_id').distinct().count()
     anomalies=Anomaly.objects.filter(student__in=qs,occurred_at__date=day,kind__in=['hors_fenetre','point_inattendu']).count()
     return {'class':class_name,'date':str(day),'total':total,'arrived':arrived,'late':late,'anomalies':anomalies}
 def summarize(stats):

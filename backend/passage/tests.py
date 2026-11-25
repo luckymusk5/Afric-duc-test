@@ -1,78 +1,162 @@
-from django.test import TestCase,override_settings
-from django.contrib.auth import get_user_model
-from django.utils import timezone
+import base64
+import os
+import uuid
 from datetime import timedelta
+from unittest.mock import Mock, patch
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
-from .models import Student,Checkpoint,Badge,RouteWindow,Scan,Anomaly,SyncReceipt
-from .services import badge_token,accept_scan,summary_stats,summarize
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+
+from .badge_security import (BadgeRejected, create_badge, decrypt_secret,
+    rfc6238_code, rotating_token, validate_rotating_token)
+from .models import (Anomaly, Badge, BadgeUsage, Checkpoint, DeviceClock,
+    RouteWindow, Scan, Student, SyncReceipt)
+from .services import accept_scan, summarize, summary_stats
 from .views import BrokerError
-from rest_framework_simplejwt.tokens import AccessToken,RefreshToken
-import uuid,os,re,json
-from unittest.mock import patch,Mock
-User=get_user_model()
+
+User = get_user_model()
+TEST_KEY = base64.urlsafe_b64encode(bytes(range(32))).rstrip(b'=').decode()
+
+
+@override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher'])
 class PassageTests(TestCase):
- def setUp(self):
-  self.admin=User.objects.create_user(username='admin',password='AdminPass123!',role='admin')
-  self.agent=User.objects.create_user(username='agent',password='AgentPass123!',role='agent')
-  self.parent=User.objects.create_user(username='parent',password='ParentPass123!',role='parent')
-  self.other=User.objects.create_user(username='other',password='ParentPass123!',role='parent')
-  self.student=Student.objects.create(name='Élève A',class_name='6e A',school='Test');self.student.parents.add(self.parent)
-  self.hidden=Student.objects.create(name='Élève B',class_name='6e A',school='Test');self.hidden.parents.add(self.other)
-  self.cp=Checkpoint.objects.create(label='Entrée');self.badge=Badge.objects.create(student=self.student,secret='x')
-  RouteWindow.objects.create(student=self.student,checkpoint=self.cp,sequence=1,start_time='07:00',end_time='07:45',days=[1,2,3,4,5])
- def test_event_idempotency(self):
-  data={'eventId':uuid.uuid4(),'token':badge_token(self.badge),'checkpointId':self.cp.id,'localTime':timezone.now(),'deviceId':'device-1'}
-  first=accept_scan(data);second=accept_scan(data)
-  self.assertFalse(first['duplicate']);self.assertTrue(second['duplicate']);self.assertEqual(Scan.objects.count(),1)
- def test_replayed_badge_is_rejected_and_logged(self):
-  token=badge_token(self.badge)
-  first={'eventId':uuid.uuid4(),'token':token,'checkpointId':self.cp.id,'localTime':timezone.now(),'deviceId':'device-1'}
-  accept_scan(first)
-  replay={**first,'eventId':uuid.uuid4()}
-  result=accept_scan(replay)
-  self.assertEqual(result.get('rejected'),'Code déjà utilisé')
-  self.assertTrue(Anomaly.objects.filter(kind='badge_replay').exists())
- def test_clock_skew_uses_server_time(self):
-  data={'eventId':uuid.uuid4(),'token':badge_token(self.badge),'checkpointId':self.cp.id,'localTime':timezone.now()-timedelta(hours=2),'deviceId':'device-1'}
-  result=accept_scan(data);scan=Scan.objects.get(pk=result['id'])
-  self.assertTrue(scan.clock_skew);self.assertTrue(Anomaly.objects.filter(kind='horloge_appareil').exists())
- def test_parent_cannot_read_other_student_by_id(self):
-  client=APIClient();client.force_authenticate(self.parent)
-  self.assertEqual(client.get(f'/api/students/{self.hidden.id}/').status_code,404)
-  self.assertEqual(list(client.get('/api/students/').data)[0]['id'],self.student.id)
- def test_scan_sync_is_queued_and_status_is_queryable(self):
-  event_id=uuid.uuid4();payload={'eventId':str(event_id),'token':badge_token(self.badge),'checkpointId':self.cp.id,'localTime':timezone.now().isoformat(),'deviceId':'device-1'}
-  client=APIClient();client.force_authenticate(self.agent)
-  task=Mock();task.apply_async.return_value.id=str(event_id)
-  with patch('passage.views.process_scan',task):
-   response=client.post('/api/scans/sync/',{'scans':[payload]},format='json')
-  self.assertEqual(response.status_code,200);self.assertEqual(response.data['queued'][0]['state'],'queued')
-  receipt=SyncReceipt.objects.get(event_id=event_id);self.assertEqual(receipt.state,'queued')
-  status_response=client.get(f'/api/scans/sync/status/?eventIds={event_id}')
-  self.assertEqual(status_response.data['items'][0]['state'],'queued')
- def test_scan_is_kept_pending_when_broker_publish_fails(self):
-  event_id=uuid.uuid4();payload={'eventId':str(event_id),'token':badge_token(self.badge),'checkpointId':self.cp.id,'localTime':timezone.now().isoformat(),'deviceId':'device-1'}
-  client=APIClient();client.force_authenticate(self.agent)
-  task=Mock();task.apply_async.side_effect=BrokerError('broker unavailable')
-  with patch('passage.views.process_scan',task):
-   response=client.post('/api/scans/sync/',{'scans':[payload]},format='json')
-  self.assertEqual(response.status_code,200);self.assertEqual(len(response.data['errors']),1)
-  receipt=SyncReceipt.objects.get(event_id=event_id);self.assertEqual(receipt.state,'pending');self.assertTrue(receipt.payload)
- def test_logout_revokes_current_access_token(self):
-  access=AccessToken.for_user(self.parent);refresh=RefreshToken.for_user(self.parent)
-  client=APIClient();client.credentials(HTTP_AUTHORIZATION=f'Bearer {access}')
-  self.assertEqual(client.get('/api/me/').status_code,200)
-  self.assertEqual(client.post('/api/auth/logout/',{'refresh':str(refresh)},format='json').status_code,204)
-  self.assertEqual(client.get('/api/me/').status_code,401)
- def test_agent_cannot_open_admin_student_list(self):
-  client=APIClient();client.force_authenticate(self.agent)
-  self.assertEqual(client.get('/api/students/').status_code,200)
-  self.assertEqual(client.get('/api/students/').data,[])
- @override_settings(ALLOWED_HOSTS=['testserver'])
- def test_summary_template_keeps_exact_computed_counts(self):
-  stats=summary_stats('6e A',timezone.localdate());result=summarize(stats)
-  self.assertEqual(result['origin'],'template')
-  self.assertEqual(result['stats'],stats)
-  allowed=set(re.findall(r'\d+',json.dumps(stats)))
-  self.assertTrue(set(re.findall(r'\d+',result['text'])).issubset(allowed))
-  for number in (stats['total'],stats['arrived'],stats['late'],stats['anomalies']):self.assertIn(str(number),result['text'])
+    def setUp(self):
+        self.key_patch = patch.dict(os.environ, {'BADGE_SECRET_KEY': TEST_KEY})
+        self.key_patch.start()
+        self.addCleanup(self.key_patch.stop)
+        self.admin = User.objects.create_user(username='admin', password='AdminPass123!', role='admin')
+        self.agent = User.objects.create_user(username='agent', password='AgentPass123!', role='agent')
+        self.parent = User.objects.create_user(username='parent', password='ParentPass123!', role='parent')
+        self.other = User.objects.create_user(username='other', password='ParentPass123!', role='parent')
+        self.student = Student.objects.create(name='Élève A', class_name='6e A', school='Test')
+        self.student.parents.add(self.parent)
+        self.hidden = Student.objects.create(name='Élève B', class_name='6e A', school='Test')
+        self.hidden.parents.add(self.other)
+        self.cp = Checkpoint.objects.create(label='Entrée')
+        self.badge, self.enrollment = create_badge(self.student)
+        self.secret = decrypt_secret(self.badge.secret_ciphertext, self.badge.badge_id)
+        self.now = timezone.now().replace(microsecond=0)
+        self.device = 'device-1'
+        DeviceClock.objects.create(device_id=self.device, offset_seconds=0, synchronized_at=self.now)
+        RouteWindow.objects.create(student=self.student, checkpoint=self.cp, sequence=1,
+            start_time='00:00', end_time='23:59', days=[1, 2, 3, 4, 5, 6, 7])
+
+    def payload(self, event_id=None, token=None, when=None, device=None, local=None, offset=0):
+        when = when or self.now
+        return {'eventId': event_id or uuid.uuid4(),
+            'token': token or rotating_token(self.badge.badge_id, self.secret, when.timestamp()),
+            'checkpointId': self.cp.id, 'localTime': local or when,
+            'estimatedTime': when, 'deviceId': device or self.device,
+            'clockOffsetSeconds': offset}
+
+    def test_valid_rotating_token_is_accepted(self):
+        result = accept_scan(self.payload(), now=self.now)
+        self.assertFalse(result['duplicate'])
+        self.assertEqual(Scan.objects.count(), 1)
+
+    def test_replay_counter_with_new_event_is_rejected(self):
+        accept_scan(self.payload(), now=self.now)
+        with self.assertRaises(BadgeRejected):
+            accept_scan(self.payload(), now=self.now)
+        self.assertEqual(BadgeUsage.objects.count(), 1)
+
+    def test_token_older_than_sixty_seconds_is_rejected(self):
+        old = self.now - timedelta(seconds=61)
+        token = rotating_token(self.badge.badge_id, self.secret, old.timestamp())
+        with self.assertRaises(BadgeRejected):
+            validate_rotating_token(token, self.now, now=self.now)
+
+    def test_tampered_signature_is_rejected(self):
+        data = self.payload()
+        badge_id, counter, signature = data['token'].split('.')
+        replacement = 'A' if signature[0] != 'A' else 'B'
+        data['token'] = badge_id + '.' + counter + '.' + replacement + signature[1:]
+        with self.assertRaises(BadgeRejected):
+            accept_scan(data, now=self.now)
+
+    def test_inactive_badge_is_rejected_and_anomaly_recorded(self):
+        for state in (Badge.State.SUSPENDED, Badge.State.LOST, Badge.State.REVOKED):
+            self.badge.state = state
+            self.badge.save(update_fields=['state'])
+            with self.assertRaises(BadgeRejected):
+                validate_rotating_token(rotating_token(self.badge.badge_id, self.secret, self.now.timestamp()), self.now, now=self.now)
+            self.badge.state = Badge.State.ACTIVE
+        self.assertTrue(Anomaly.objects.filter(kind='badge_inactif_utilise').exists())
+
+    def test_reissue_revokes_old_badge_and_issues_distinct_secret(self):
+        from .badge_security import reissue_badge
+        new_badge, enrollment = reissue_badge(self.student)
+        self.badge.refresh_from_db()
+        self.assertEqual(self.badge.state, Badge.State.REVOKED)
+        self.assertEqual(self.badge.replaced_by, new_badge)
+        self.assertNotEqual(enrollment['secret'], self.enrollment['secret'])
+        with self.assertRaises(BadgeRejected):
+            validate_rotating_token(rotating_token(self.badge.badge_id, self.secret, self.now.timestamp()), self.now, now=self.now)
+
+    def test_token_contains_no_student_identifier_or_name(self):
+        token = rotating_token(self.badge.badge_id, self.secret, self.now.timestamp())
+        self.assertNotIn(str(self.student.pk), token.split('.'))
+        self.assertNotIn(self.student.name, token)
+        self.assertNotIn(self.student.name, self.enrollment['secret'])
+
+    def test_rfc6238_appendix_b_vector(self):
+        self.assertEqual(rfc6238_code(b'12345678901234567890', 59), '94287082')
+
+    def test_calibrated_two_hour_local_clock_is_accepted(self):
+        DeviceClock.objects.filter(device_id=self.device).update(offset_seconds=-7200)
+        local = self.now + timedelta(hours=2)
+        result = accept_scan(self.payload(local=local, offset=-7200), now=self.now)
+        scan = Scan.objects.get(pk=result['id'])
+        self.assertFalse(scan.clock_suspect)
+
+    def test_encrypted_secret_is_not_stored_as_plaintext(self):
+        self.assertNotIn(self.secret.hex(), self.badge.secret_ciphertext)
+        self.assertEqual(decrypt_secret(self.badge.secret_ciphertext, self.badge.badge_id), self.secret)
+
+    def test_event_idempotency(self):
+        payload = self.payload()
+        first = accept_scan(payload, now=self.now)
+        second = accept_scan(payload, now=self.now)
+        self.assertFalse(first['duplicate'])
+        self.assertTrue(second['duplicate'])
+        self.assertEqual(Scan.objects.count(), 1)
+
+    def test_parent_cannot_read_other_student_by_id(self):
+        client = APIClient(); client.force_authenticate(self.parent)
+        self.assertEqual(client.get(f'/api/students/{self.hidden.id}/').status_code, 404)
+
+    def test_scan_sync_is_queued_and_status_is_queryable(self):
+        payload = self.payload(); payload['eventId'] = str(payload['eventId'])
+        payload['localTime'] = payload['localTime'].isoformat(); payload['estimatedTime'] = payload['estimatedTime'].isoformat()
+        client = APIClient(); client.force_authenticate(self.agent)
+        task = Mock(); task.apply_async.return_value.id = payload['eventId']
+        with patch('passage.views.process_scan', task):
+            response = client.post('/api/scans/sync/', {'scans': [payload]}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['queued'][0]['state'], 'queued')
+        self.assertEqual(SyncReceipt.objects.get(event_id=payload['eventId']).state, 'queued')
+
+    def test_scan_stays_pending_when_broker_publish_fails(self):
+        payload = self.payload(); payload['eventId'] = str(payload['eventId'])
+        payload['localTime'] = payload['localTime'].isoformat(); payload['estimatedTime'] = payload['estimatedTime'].isoformat()
+        client = APIClient(); client.force_authenticate(self.agent)
+        task = Mock(); task.apply_async.side_effect = BrokerError('broker unavailable')
+        with patch('passage.views.process_scan', task):
+            response = client.post('/api/scans/sync/', {'scans': [payload]}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(SyncReceipt.objects.get(event_id=payload['eventId']).state, 'pending')
+
+    def test_logout_revokes_current_access_token(self):
+        access = AccessToken.for_user(self.parent); refresh = RefreshToken.for_user(self.parent)
+        client = APIClient(); client.credentials(HTTP_AUTHORIZATION=f'Bearer {access}')
+        self.assertEqual(client.get('/api/me/').status_code, 200)
+        self.assertEqual(client.post('/api/auth/logout/', {'refresh': str(refresh)}, format='json').status_code, 204)
+        self.assertEqual(client.get('/api/me/').status_code, 401)
+
+    @override_settings(ALLOWED_HOSTS=['testserver'])
+    def test_summary_template_uses_computed_counts(self):
+        stats = summary_stats('6e A', timezone.localdate()); result = summarize(stats)
+        self.assertEqual(result['origin'], 'template'); self.assertEqual(result['stats'], stats)

@@ -1,9 +1,9 @@
 from django.core.management.base import BaseCommand
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
-from passage.models import Student,Checkpoint,Badge,RouteWindow
+from passage.models import Student,Checkpoint,RouteWindow
 from django.utils import timezone
-import secrets
+from passage.badge_security import create_badge
 class Command(BaseCommand):
     help='Crée un jeu de données de démonstration local.'
     def handle(self,*args,**kwargs):
@@ -19,7 +19,7 @@ class Command(BaseCommand):
         students[0].parents.add(users[2]);students[1].parents.add(users[2]);students[2].parents.add(users[3]);students[3].parents.add(users[3])
         entry=Checkpoint.objects.create(label='Portail entrée',kind='gate'); exit=Checkpoint.objects.create(label='Portail sortie',kind='gate')
         for student in students:
-            Badge.objects.create(student=student,secret=secrets.token_hex(32))
+            create_badge(student)
             RouteWindow.objects.create(student=student,checkpoint=entry,sequence=1,start_time='07:00',end_time='07:45',days=[1,2,3,4,5])
             RouteWindow.objects.create(student=student,checkpoint=exit,sequence=2,start_time='15:30',end_time='16:15',days=[1,2,3,4,5])
         self.stdout.write(self.style.SUCCESS('Données de démonstration créées.'))

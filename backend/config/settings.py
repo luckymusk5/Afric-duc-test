@@ -1,4 +1,5 @@
 import os
+import base64
 from pathlib import Path
 BASE_DIR=Path(__file__).resolve().parent.parent
 ENV_FILE=BASE_DIR.parent/'.env'
@@ -11,7 +12,11 @@ if ENV_FILE.exists():
 SECRET_KEY=os.getenv('DJANGO_SECRET_KEY','unsafe-local-key-change-before-deploy')
 DEBUG=os.getenv('DEBUG','0')=='1'
 if not DEBUG and (len(SECRET_KEY)<40 or 'replace-' in SECRET_KEY or 'unsafe-' in SECRET_KEY): raise RuntimeError('DJANGO_SECRET_KEY doit être remplacée par un secret aléatoire de 40 caractères minimum.')
-if not DEBUG and (len(os.getenv('BADGE_SIGNING_KEY',''))<40 or 'replace-' in os.getenv('BADGE_SIGNING_KEY','')): raise RuntimeError('BADGE_SIGNING_KEY doit être défini avec au moins 40 caractères aléatoires.')
+if not DEBUG:
+    badge_key=os.getenv('BADGE_SECRET_KEY','')
+    try: badge_key_bytes=base64.urlsafe_b64decode((badge_key+'='*(-len(badge_key)%4)).encode('ascii'))
+    except (ValueError,UnicodeEncodeError): raise RuntimeError('BADGE_SECRET_KEY doit être une clé Base64 URL-safe de 32 octets.')
+    if len(badge_key_bytes)!=32: raise RuntimeError('BADGE_SECRET_KEY doit décoder exactement 32 octets.')
 ALLOWED_HOSTS=os.getenv('ALLOWED_HOSTS','localhost,127.0.0.1,backend').split(',')
 INSTALLED_APPS=['django.contrib.admin','django.contrib.auth','django.contrib.contenttypes','django.contrib.sessions','django.contrib.messages','django.contrib.staticfiles','rest_framework','rest_framework_simplejwt.token_blacklist','corsheaders','passage']
 MIDDLEWARE=['django.middleware.security.SecurityMiddleware','corsheaders.middleware.CorsMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.messages.middleware.MessageMiddleware','django.middleware.clickjacking.XFrameOptionsMiddleware']
