@@ -12,10 +12,13 @@ MVP du module de suivi des passages d’élèves par badge, avec file hors ligne
 
 ## Démarrage
 
-```bash
-Copy-Item .env.example .env
+```powershell
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
+# Génère BADGE_SECRET_KEY avec la commande ci-dessous, puis démarre les services.
 docker compose up --build
 ```
+
+Avant la première migration des badges, génère `BADGE_SECRET_KEY` comme clé URL-safe de 32 octets et garde-la sauvegardée: sous PowerShell, exécute `[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_')`, puis colle le résultat dans `.env`. Ne régénère pas cette clé tant que les badges chiffrés par l’ancienne valeur sont utilisés.
 
 L’application web est sur http://localhost:5173, l’API sur http://localhost:8000/api et RabbitMQ Management sur http://localhost:15672. Les migrations versionnées dans le dépôt sont appliquées au démarrage, puis un jeu de données local est ajouté; le worker Celery consomme la file durable `scan_sync`. Les identifiants Management sont ceux de `RABBITMQ_DEFAULT_USER` et `RABBITMQ_DEFAULT_PASS` dans `.env`. Les évolutions doivent ensuite être livrées comme migrations versionnées.
 
@@ -44,7 +47,9 @@ python manage.py runserver
 - `POST /api/auth/login/`, `POST /api/auth/refresh/`, `POST /api/auth/logout/`
 - `GET /api/me/`
 - `GET /api/students/` (admin et parent; portée filtrée côté serveur)
-- `GET /api/students/{id}/badge-token/` (admin)
+- `POST /api/students/{id}/badges/reissue/` (admin; émet une fois le secret d’enrôlement)
+- `GET /api/badges/` et `PATCH /api/badges/{uuid}/state/` (admin; gestion du cycle de vie)
+- `POST /api/devices/time-sync/` (agent ou responsable; calibre l’horloge d’un terminal)
 - `POST /api/scans/sync/` (agent ou responsable; confirme la publication durable dans RabbitMQ)
 - `GET /api/scans/sync/status/?eventIds=uuid,...` (état du traitement jusqu’à l’écriture PostgreSQL)
 - `GET /api/scans/`, `GET /api/anomalies/`, `GET /api/outbox/`
@@ -53,11 +58,11 @@ python manage.py runserver
 
 ## Sécurité
 
-Les mots de passe sont hachés par Django (PBKDF2 par défaut) avec validation de longueur minimale de huit caractères. L’authentification JWT limite l’accès à 30 minutes, le renouvellement à huit heures; la déconnexion révoque immédiatement le jeton d’accès courant et met le jeton de renouvellement en liste noire. La route de connexion a une limite de cinq tentatives par minute et conserve l’erreur générique du mécanisme JWT. Les permissions et le cloisonnement parent/enfant sont appliqués dans les querysets/API. Les paramètres sont validés par DRF et les requêtes passent par l’ORM. React rend les champs comme texte échappé. Les secrets sont configurables par variables d’environnement; `.env.example` ne contient que des exemples. Les codes badge sont signés HMAC, expirent rapidement et ne peuvent être consommés qu’une fois. Pour la production, utiliser HTTPS, clés séparées et renouvelables, appareils enrôlés et authentification renforcée.
+Les mots de passe sont hachés par Django (PBKDF2 par défaut). Chaque badge possède un UUID aléatoire sans donnée élève et un secret aléatoire de 256 bits. Le secret est chiffré en base par AES-256-GCM avec un nonce aléatoire et l’UUID comme donnée associée; la clé `BADGE_SECRET_KEY` doit être une clé Base64 URL-safe de 32 octets, conservée hors base. La migration `0003` chiffre les anciens secrets: définir cette même clé avant `migrate`, la sauvegarder et la conserver pour les futures lectures; une perte de clé empêche de valider les badges. Le secret d’enrôlement n’est renvoyé qu’une fois lors de l’émission/remplacement, puis le navigateur élève le conserve localement et ne l’affiche plus. Le QR tournant comprend UUID, compteur de 30 secondes et HMAC-SHA256 tronqué à 128 bits; il ne contient pas l’identité. Le format est volontairement spécifique au projet et utilise SHA-256, tandis que le test RFC 6238 vérifie séparément le vecteur normatif TOTP-SHA1. Les compteurs consommés ont une contrainte unique en base: réutiliser un code pour un autre événement échoue même si deux workers traitent en parallèle. Les réponses de refus des badges sont génériques et les tentatives sont limitées à 60 par terminal et par minute. Les jetons ont une tolérance de compteur d’environ une minute autour de l’heure estimée; une file hors ligne très ancienne peut donc être rejetée. Une horloge monotone du navigateur sert à estimer l’heure après calibration. Après redémarrage/rechargement, le terminal doit se recalibrer en ligne. Les identifiants d’appareil stockés côté navigateur ne constituent pas une identité matérielle inviolable. TLS, sauvegarde/rotation organisée de la clé et enrôlement/authentification matériel des terminaux sont nécessaires avant production.
 
 ## Hors ligne et anomalies
 
-Le navigateur conserve chaque scan avec UUID dans localStorage tant que l’API ne confirme pas son dépôt dans RabbitMQ. À la reconnexion, Django vérifie le badge et persiste un reçu dans PostgreSQL avant de publier le message. RabbitMQ utilise une file quorum durable, des messages persistants et les publisher confirms; le worker Celery acquitte après traitement et réessaie les erreurs transitoires. L’interface interroge le statut jusqu’à l’écriture PostgreSQL. La contrainte unique sur `event_id` rend le traitement idempotent même après une livraison répétée. Si le broker est inaccessible, l’API retourne une erreur et l’élément reste dans la file du navigateur. Le serveur garde l’heure locale déclarée, l’heure serveur et le terminal; une dérive supérieure à cinq minutes est signalée, l’heure serveur restant l’heure de référence. Les anomalies incluent passage manquant, hors fenêtre, point inattendu, double scan rapide, badge rejoué et horloge incohérente. `close-windows` doit être appelé régulièrement par un ordonnanceur externe pour détecter les absences sans visite de l’interface. Les messages restent dans une boîte sortante avec plafond quotidien configurable.
+Le navigateur agent conserve chaque scan avec UUID dans localStorage tant que l’API ne confirme pas son dépôt dans RabbitMQ. À la reconnexion, Django vérifie le badge et persiste un reçu PostgreSQL avant publication. RabbitMQ utilise une file quorum durable, des messages persistants et les publisher confirms; le worker Celery acquitte après traitement et réessaie les erreurs transitoires. L’interface interroge le statut jusqu’à l’écriture PostgreSQL. La contrainte unique sur `event_id` rend la livraison idempotente. L’heure du scan est construite depuis l’ancre serveur et `performance.now()`; le terminal garde aussi son heure civile déclarée. Une dérive supérieure à cinq minutes est signalée. Un jeton authentique peut encore être copié et relayé en direct avant sa première utilisation: rotation courte et anti-rejeu n’empêchent pas à eux seuls ce relais. Un PIN/NFC ou un protocole défi-réponse avec terminal authentifié serait nécessaire pour le bloquer.
 
 ## Synthèse IA
 
@@ -73,4 +78,4 @@ GitHub Actions démarre PostgreSQL et exécute les tests API/métier à chaque p
 
 ## Limites à terminer
 
-Ce dépôt constitue un MVP et non un déploiement complet. Le code QR actuel est un code tournant à courte durée de vie; la synchronisation longue hors ligne et la résistance au partage de photo nécessitent un protocole d’appareil enrôlé (défi signé à usage unique / NFC), à valider avant usage réel. La page agent permet d’entrer le code mais n’intègre pas encore la caméra. Les exceptions de calendrier, la gestion UI du cycle de vie de badge et la tâche planifiée système restent à compléter. Les vidéos de démonstration et de communication doivent être produites après lancement de l’application.
+Voir [DECISIONS.md](DECISIONS.md) pour le raisonnement sécurité détaillé et les limites de la solution.

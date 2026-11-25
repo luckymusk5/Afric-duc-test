@@ -1,12 +1,39 @@
-# DECISIONS
+# Décisions — badge QR tournant
 
-1. **Stack** — Django/DRF, React, PostgreSQL et Docker; écartés: framework full-stack monolithique et SQLite; raisons: séparation API/UI et base multi-utilisateurs reproductible.
-2. **Authentification** — JWT 30 min + refresh 8 h avec liste noire; écartées: session navigateur et jeton de longue durée; choix adapté à la SPA avec révocation du refresh.
-3. **Code badge** — HMAC tournant chaque minute; écarté: identifiant statique; un code photographié expire, et l’agent doit obtenir un code frais. Limite: l’agent doit avoir synchronisé le code pendant le réseau; vraie résistance hors ligne exige badge cryptographique/NFC ou enrôlement d’appareil.
-4. **Synchronisation** — UUID créé côté client et contrainte unique en PostgreSQL; écartée: dédoublonnage par heure/élève qui peut fusionner deux vrais passages.
-5. **Horloge erronée** — garder l’heure locale pour audit, signaler >5 min d’écart et utiliser l’heure serveur pour règles/rapports; écarté: rejeter le passage qui priverait l’élève d’une preuve de présence.
-6. **Détection du passage manquant** — endpoint idempotent de clôture des fenêtres, prévu pour cron; écarté: calcul lors d’une consultation car l’anomalie doit exister sans ouverture d’écran.
-7. **Cinquième anomalie** — horloge incohérente et badge rejoué; retenues car elles couvrent intégrité temporelle et tentative de fraude.
-8. **Notifications** — table outbox avec interface API et plafond par parent/jour; écarté: fournisseur SMS intégré directement pour garder l’envoi remplaçable.
-9. **IA** — gabarit exact sans API, schéma JSON borné, contrôle des chiffres, cache et budget; écartée: génération libre des nombres par le modèle.
-10. **Synchronisation réseau** — file locale `localStorage` garde les scans hors ligne; au retour réseau, PostgreSQL enregistre un reçu puis RabbitMQ quorum durable livre le travail à Celery; UUID stable et contrainte unique assurent l’idempotence. Écarté: publier directement depuis le navigateur dans RabbitMQ, ce qui exposerait le broker et ne fonctionnerait pas hors ligne. À migrer vers IndexedDB si la file locale grandit ou contient des pièces jointes.
+## Menaces traitées
+
+Le protocole vise la copie d’un QR statique, la modification d’un jeton, le rejeu d’un passage, la lecture des secrets depuis la base, les doubles traitements concurrents et les dérives d’horloge accidentelles. Il ne peut pas, à lui seul, empêcher un relais en direct d’un QR authentique avant son premier usage ni protéger un téléphone compromis.
+
+## Choix du format
+
+Le jeton est `badge_uuid.counter.signature`, où le compteur est le nombre de périodes UTC de 30 secondes depuis l’époque Unix. La signature est HMAC-SHA256 du texte `uuid.compteur`, tronquée à 16 octets puis encodée en Base64 URL-safe sans remplissage; ce format de projet est inspiré de TOTP mais n’est pas l’encodage RFC 6238.
+
+Le secret aléatoire a 256 bits; l’identifiant public est un UUID aléatoire indépendant et ne contient aucune information de l’élève. Le navigateur du badge calcule les jetons avec Web Crypto, tandis que l’agent ne reçoit que le jeton tournant.
+
+## Chiffrement et stockage
+
+Le secret est chiffré avec AES-256-GCM, un nonce aléatoire neuf de 96 bits et l’UUID du badge en donnée associée. `BADGE_SECRET_KEY` est une clé de chiffrement dédiée de 32 octets encodée en Base64 URL-safe; une rotation de cette clé nécessite une migration de rechiffrement planifiée, car une perte de clé rend les badges inutilisables.
+
+Le secret d’enrôlement est renvoyé une seule fois par l’action d’émission et n’est pas inclus dans le sérialiseur ni dans l’interface d’administration. Le navigateur élève le garde dans son stockage local afin qu’il survive au rafraîchissement; le verrouillage du téléphone et une distribution privée du QR restent nécessaires.
+
+La migration `0003` assigne un UUID à chaque ancien badge, décode son secret hexadécimal historique de 32 octets, le chiffre et supprime ensuite la colonne en clair. Elle est irréversible sans la clé historique pour l’opération inverse; sauvegarder la clé et la base avant la migration.
+
+## Anti-rejeu et idempotence
+
+La validation vérifie état actif, HMAC constant-time et compteur correspondant à l’heure estimée avec tolérance d’une période de part et d’autre. Une contrainte SQL unique `(badge, counter)` n’autorise ensuite qu’une seule consommation du jeton, y compris lorsque plusieurs workers tentent de traiter la même valeur.
+
+`event_id` unique protège l’idempotence de la file et `BadgeUsage` protège l’usage du code; ce sont deux protections distinctes. Les erreurs de badge sont présentées sous un message générique afin de ne pas révéler si un identifiant existe, si le badge est suspendu ou si la signature échoue.
+
+## Temps et mode hors ligne
+
+Après calibration en ligne, l’agent avance l’heure estimée avec `performance.now()`, une horloge monotone qui ne saute pas lors d’une correction de l’heure système. Le terminal recalcule la calibration après rechargement ou redémarrage, et le backend signale un décalage de plus de cinq minutes entre temps civil local et estimation.
+
+Une file locale conserve l’événement et son jeton jusqu’à l’accusé de réception de l’API; le scan attend aussi une validation finale du worker après dépôt RabbitMQ. Comme le jeton reste rattaché à un compteur de 30 secondes, les événements différés pendant une longue coupure peuvent sortir de la fenêtre acceptée et être refusés à la reprise; accepter des scans arbitrairement anciens affaiblirait le contrôle de fraîcheur.
+
+Le compteur unique bloque un deuxième usage même si un code a été photographié, mais ne prouve pas que le téléphone était physiquement devant l’agent. Pour contrer le relais en direct, ajouter un terminal enrôlé avec clé matériellement protégée et défi aléatoire signé, ou utiliser NFC/présence locale.
+
+## Limitation et tests
+
+Le backend limite à 60 tentatives par terminal et par minute. Cette limite réduit le balayage d’identifiants et les erreurs répétées; un `deviceId` navigateur n’est pas une identité fiable face à un agent malveillant, donc la production devra enrôler les appareils côté serveur.
+
+Les tests couvrent jeton valide, rejeu, jeton trop ancien, signature altérée, badges suspendu/perdu/révoqué, remplacement, absence de données personnelles dans le jeton, vecteur RFC 6238 Appendix B, horloge locale décalée de deux heures après calibration et chiffrement au repos. Le test RFC est un oracle de calcul TOTP SHA-1 indépendant et ne signifie pas que le format applicatif est interopérable avec les applications TOTP.
