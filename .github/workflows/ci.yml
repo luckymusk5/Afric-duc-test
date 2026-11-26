@@ -30,4 +30,4 @@ jobs:
       - run: pip install -r backend/requirements.txt
       - run: python backend/manage.py makemigrations passage --check --dry-run --noinput
       - name: Run passage tests
-        run: python backend/manage.py test passage.tests
+        run: python backend/manage.py test passage
