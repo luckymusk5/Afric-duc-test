@@ -29,5 +29,5 @@ jobs:
         with: {python-version: '3.12'}
       - run: pip install -r backend/requirements.txt
       - run: python backend/manage.py makemigrations passage --check --dry-run --noinput
-      - name: Run rotating student QR security tests
-        run: python backend/manage.py test passage.test_badge_security
+      - name: Run passage tests
+        run: python backend/manage.py test passage.tests
