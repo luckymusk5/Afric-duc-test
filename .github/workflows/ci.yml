@@ -1,8 +1,17 @@
-name: Student QR security
+name: CI
 on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings
+      PYTHONPATH: backend
+      DEBUG: "1"
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: passage
+      POSTGRES_USER: passage
+      POSTGRES_PASSWORD: passage
+      BADGE_SECRET_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
     services:
       postgres:
         image: postgres:16
@@ -19,23 +28,6 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.12'}
       - run: pip install -r backend/requirements.txt
-      - name: Check model migrations
-        run: python backend/manage.py makemigrations passage --check --dry-run --noinput
-        env:
-          DJANGO_SETTINGS_MODULE: config.settings
-          PYTHONPATH: backend
-          DEBUG: "1"
-          POSTGRES_HOST: localhost
-          POSTGRES_DB: passage
-          POSTGRES_USER: passage
-          POSTGRES_PASSWORD: passage
-      - name: Run student QR security tests
-        run: python backend/manage.py test passage.test_badge_security
-        env:
-          DJANGO_SETTINGS_MODULE: config.settings
-          PYTHONPATH: backend
-          DEBUG: "1"
-          POSTGRES_HOST: localhost
-          POSTGRES_DB: passage
-          POSTGRES_USER: passage
-          POSTGRES_PASSWORD: passage
+      - run: python backend/manage.py makemigrations passage --check --dry-run --noinput
+      - name: Run passage tests
+        run: python backend/manage.py test passage.tests
