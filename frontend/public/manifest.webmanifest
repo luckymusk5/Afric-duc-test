@@ -1,0 +1,10 @@
+{
+  "name": "Afric’Éduc — Passages",
+  "short_name": "Passages",
+  "lang": "fr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f3f6f2",
+  "theme_color": "#237a4e"
+}

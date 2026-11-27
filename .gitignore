@@ -1,4 +1,5 @@
 .env
+action.md
 *.py[cod]
 __pycache__/
 backend/passagedb.sqlite3

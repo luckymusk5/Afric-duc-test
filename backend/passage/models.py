@@ -1,6 +1,7 @@
 import uuid
 from django.contrib.auth.models import AbstractUser
 from django.db import models
+from django.utils import timezone
 
 
 class User(AbstractUser):
@@ -8,6 +9,7 @@ class User(AbstractUser):
         ADMIN = 'admin', 'Responsable'
         AGENT = 'agent', 'Agent'
         PARENT = 'parent', 'Parent'
+        STUDENT = 'student', 'Élève'
 
     role = models.CharField(max_length=12, choices=Role.choices, default=Role.PARENT)
 
@@ -17,6 +19,7 @@ class Student(models.Model):
     class_name = models.CharField(max_length=80)
     school = models.CharField(max_length=120)
     active = models.BooleanField(default=True)
+    account = models.OneToOneField('User', null=True, blank=True, on_delete=models.SET_NULL, related_name='student_profile', limit_choices_to={'role': 'student'})
     parents = models.ManyToManyField(User, related_name='children', limit_choices_to={'role': 'parent'})
 
     def __str__(self):
@@ -29,6 +32,26 @@ class Checkpoint(models.Model):
 
     def __str__(self):
         return self.label
+
+
+class Device(models.Model):
+    device_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    active = models.BooleanField(default=True)
+    token_hash = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return str(self.device_id)
+
+
+class DeviceAssignment(models.Model):
+    device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name='assignments')
+    checkpoint = models.ForeignKey(Checkpoint, on_delete=models.PROTECT)
+    starts_at = models.DateTimeField(default=timezone.now)
+    ends_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['starts_at']
 
 
 class Badge(models.Model):
@@ -57,35 +80,94 @@ class BadgeUsage(models.Model):
 
 
 class RouteWindow(models.Model):
+    class Direction(models.TextChoices):
+        ENTRY = 'entry', 'Entrée'
+        EXIT = 'exit', 'Sortie'
+
     student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='route_windows')
     checkpoint = models.ForeignKey(Checkpoint, on_delete=models.CASCADE)
     sequence = models.PositiveSmallIntegerField()
     start_time = models.TimeField()
     end_time = models.TimeField()
     days = models.JSONField(default=list)
+    direction = models.CharField(max_length=8, choices=Direction.choices, default=Direction.ENTRY)
+    active = models.BooleanField(default=True)
+
+
+class RouteWindowException(models.Model):
+    window = models.ForeignKey(RouteWindow, on_delete=models.CASCADE, related_name='exceptions')
+    date_jour = models.DateField()
+    active = models.BooleanField(default=True)
+    start_time = models.TimeField(null=True, blank=True)
+    end_time = models.TimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['window', 'date_jour'], name='unique_route_window_exception'),
+        ]
 
 
 class Scan(models.Model):
-    event_id = models.UUIDField(unique=True)
-    badge = models.ForeignKey(Badge, on_delete=models.PROTECT)
-    checkpoint = models.ForeignKey(Checkpoint, on_delete=models.PROTECT)
+    class Result(models.TextChoices):
+        ACCEPTED = 'accepte', 'Accepté'
+        REFUSED = 'refuse', 'Refusé'
+
+    event_id = models.UUIDField()
+    badge = models.ForeignKey(Badge, null=True, blank=True, on_delete=models.PROTECT)
+    checkpoint = models.ForeignKey(Checkpoint, null=True, blank=True, on_delete=models.PROTECT)
     local_time = models.DateTimeField()
     estimated_time = models.DateTimeField(null=True)
     received_at = models.DateTimeField(auto_now_add=True)
     device_id = models.CharField(max_length=100)
     clock_offset_seconds = models.FloatField(default=0)
     clock_suspect = models.BooleanField(default=False)
+    result = models.CharField(max_length=8, choices=Result.choices, default=Result.ACCEPTED)
+    device_record = models.ForeignKey(Device, null=True, blank=True, on_delete=models.SET_NULL, related_name='scans')
+    server_time = models.DateTimeField(null=True, blank=True)
+    direction = models.CharField(max_length=8, choices=RouteWindow.Direction.choices, default=RouteWindow.Direction.ENTRY)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['device_id', 'event_id'], name='unique_device_event'),
+        ]
 
 
 class Anomaly(models.Model):
+    class State(models.TextChoices):
+        OPEN = 'open', 'À traiter'
+        PROVISIONAL = 'provisional', 'Provisoire'
+        CAUGHT_UP = 'caught_up', 'Rattrapée'
+
     student = models.ForeignKey(Student, on_delete=models.CASCADE)
     kind = models.CharField(max_length=40)
     occurred_at = models.DateTimeField()
     scan = models.ForeignKey(Scan, null=True, blank=True, on_delete=models.SET_NULL)
     details = models.CharField(max_length=250, blank=True)
+    state = models.CharField(max_length=12, choices=State.choices, default=State.OPEN)
+    route_window = models.ForeignKey(RouteWindow, null=True, blank=True, on_delete=models.SET_NULL)
+    date_jour = models.DateField(null=True, blank=True)
 
     class Meta:
-        constraints = [models.UniqueConstraint(fields=['student', 'kind', 'occurred_at', 'scan'], name='unique_student_anomaly')]
+        constraints = [
+            models.UniqueConstraint(fields=['student', 'kind', 'occurred_at', 'scan'], name='unique_student_anomaly'),
+            models.UniqueConstraint(
+                fields=['student', 'date_jour', 'route_window', 'kind'],
+                condition=models.Q(date_jour__isnull=False, route_window__isnull=False),
+                name='unique_student_window_anomaly',
+            ),
+        ]
+
+
+class PresenceJournal(models.Model):
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='presence_journal')
+    date_jour = models.DateField()
+    heure_entree = models.DateTimeField(null=True, blank=True)
+    heure_sortie = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['student', 'date_jour'], name='unique_student_presence_day'),
+        ]
 
 
 class OutboxMessage(models.Model):
@@ -129,13 +211,9 @@ class AIUsageLog(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
-class RevokedAccessToken(models.Model):
-    jti = models.CharField(max_length=64, unique=True)
-    expires_at = models.DateTimeField()
-    revoked_at = models.DateTimeField(auto_now_add=True)
-
-
 class SyncReceipt(models.Model):
+    """Ancienne table de suivi conservée pour préserver les bases existantes."""
+
     class State(models.TextChoices):
         PENDING = 'pending', 'En attente de publication'
         QUEUED = 'queued', 'En file RabbitMQ'
@@ -151,6 +229,12 @@ class SyncReceipt(models.Model):
     error = models.CharField(max_length=250, blank=True)
     received_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class RevokedAccessToken(models.Model):
+    jti = models.CharField(max_length=64, unique=True)
+    expires_at = models.DateTimeField()
+    revoked_at = models.DateTimeField(auto_now_add=True)
 
 
 class DeviceClock(models.Model):

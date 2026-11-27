@@ -1,27 +1,14 @@
 services:
-  rabbitmq:
-    image: rabbitmq:4-management
-    restart: unless-stopped
-    environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-schoollogs}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local-rabbit-change-me}
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
   db:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-passage}
       POSTGRES_USER: ${POSTGRES_USER:-passage}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-passage-local}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    networks:
+      - default
+      - student-qr-private
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -33,44 +20,90 @@ services:
     build: ./backend
     environment:
       POSTGRES_HOST: db
-      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-schoollogs}:${RABBITMQ_DEFAULT_PASS:-local-rabbit-change-me}@rabbitmq:5672//
       POSTGRES_DB: ${POSTGRES_DB:-passage}
       POSTGRES_USER: ${POSTGRES_USER:-passage}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-passage-local}
-      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-local-only-change-me}
-      BADGE_SECRET_KEY: ${BADGE_SECRET_KEY:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      BADGE_SECRET_KEY: ${BADGE_SECRET_KEY:?Set BADGE_SECRET_KEY in .env}
       DEBUG: ${DEBUG:-1}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_API_URL: ${AI_API_URL:-}
       AI_MODEL: ${AI_MODEL:-gpt-4o-mini}
       AI_MONTHLY_BUDGET: ${AI_MONTHLY_BUDGET:-2}
       MAX_DAILY_MESSAGES: ${MAX_DAILY_MESSAGES:-5}
+      PASSAGE_GRACE_MINUTES: ${PASSAGE_GRACE_MINUTES:-15}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-http://localhost:5173}
+      STUDENT_QR_SERVICE_URL: http://qr-generator:8081
+      QR_SERVICE_TOKEN: ${QR_SERVICE_TOKEN:?Set QR_SERVICE_TOKEN in .env}
+      QR_DB_USER: ${QR_DB_USER:-qr_reader}
+      QR_DB_PASSWORD: ${QR_DB_PASSWORD:?Set QR_DB_PASSWORD in .env}
+      DEMO_ADMIN_PASSWORD: ${DEMO_ADMIN_PASSWORD:?Set DEMO_ADMIN_PASSWORD in .env}
+      DEMO_AGENT_PASSWORD: ${DEMO_AGENT_PASSWORD:?Set DEMO_AGENT_PASSWORD in .env}
+      DEMO_PARENT1_PASSWORD: ${DEMO_PARENT1_PASSWORD:?Set DEMO_PARENT1_PASSWORD in .env}
+      DEMO_PARENT2_PASSWORD: ${DEMO_PARENT2_PASSWORD:?Set DEMO_PARENT2_PASSWORD in .env}
     ports: ["8000:8000"]
     depends_on:
       db:
         condition: service_healthy
-  celery:
+      qr-generator:
+        condition: service_healthy
+    networks:
+      - default
+      - student-qr-private
+  qr-generator:
+    build: ./qr-service
+    restart: unless-stopped
+    environment:
+      QR_SERVICE_TOKEN: ${QR_SERVICE_TOKEN:?Set QR_SERVICE_TOKEN in .env}
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-passage}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      QR_DB_USER: ${QR_DB_USER:-qr_reader}
+      QR_DB_PASSWORD: ${QR_DB_PASSWORD:?Set QR_DB_PASSWORD in .env}
+      BADGE_SECRET_KEY: ${BADGE_SECRET_KEY:?Set BADGE_SECRET_KEY in .env}
+    expose: ["8081"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    user: "10001:10001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    networks:
+      - student-qr-private
+    depends_on:
+      db:
+        condition: service_healthy
+  scheduler:
     build: ./backend
-    command: ["celery", "-A", "config", "worker", "--loglevel=info", "-Q", "scan_sync", "--concurrency=2"]
+    command: ["python", "manage.py", "run_scheduler"]
+    restart: unless-stopped
     environment:
       POSTGRES_HOST: db
       POSTGRES_DB: ${POSTGRES_DB:-passage}
       POSTGRES_USER: ${POSTGRES_USER:-passage}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-passage-local}
-      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-local-only-change-me}
-      BADGE_SECRET_KEY: ${BADGE_SECRET_KEY:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      BADGE_SECRET_KEY: ${BADGE_SECRET_KEY:?Set BADGE_SECRET_KEY in .env}
       DEBUG: ${DEBUG:-1}
-      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-schoollogs}:${RABBITMQ_DEFAULT_PASS:-local-rabbit-change-me}@rabbitmq:5672//
       MAX_DAILY_MESSAGES: ${MAX_DAILY_MESSAGES:-5}
+      PASSAGE_GRACE_MINUTES: ${PASSAGE_GRACE_MINUTES:-15}
     depends_on:
       db:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+      backend:
+        condition: service_started
   frontend:
     build: ./frontend
     ports: ["5173:5173"]
     depends_on: [backend]
 volumes:
   postgres_data:
-  rabbitmq_data:
+networks:
+  default: {}
+  student-qr-private:
+    internal: true

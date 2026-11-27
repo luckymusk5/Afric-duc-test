@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .models import Badge, BadgeUsage, Anomaly, DeviceClock, DeviceRateWindow, Scan
 from .notifications import notification_gateway
 
-COUNTER_PERIOD_SECONDS = 30
+COUNTER_PERIOD_SECONDS = 15
 _SIGNATURE_PATTERN = re.compile(r'^[A-Za-z0-9_-]{22}$')
 _COUNTER_PATTERN = re.compile(r'^(0|[1-9][0-9]{0,12})$')
 
@@ -142,21 +142,21 @@ def _record_inactive_use(badge, now):
             notification_gateway.queue(parent, anomaly)
 
 
-def validate_rotating_token(token, estimated_time, now=None):
+def validate_rotating_token(token, estimated_time, now=None, check_active=True):
     badge_id, counter, supplied_signature = parse_rotating_token(token)
     badge = Badge.objects.select_related('student').filter(badge_id=badge_id).first()
     if badge is None:
         raise BadgeRejected
     now = now or timezone.now()
-    if badge.state != Badge.State.ACTIVE or not badge.student.active:
-        _record_inactive_use(badge, now)
-        raise BadgeRejected
     try:
         secret = decrypt_secret(badge.secret_ciphertext, badge.badge_id)
     except ImproperlyConfigured:
         raise
     expected = base64.urlsafe_b64decode(signature_for(secret, badge_id, counter) + '==')
     if not hmac.compare_digest(expected, supplied_signature):
+        raise BadgeRejected
+    if check_active and (badge.state != Badge.State.ACTIVE or not badge.student.active):
+        _record_inactive_use(badge, now)
         raise BadgeRejected
     if not isinstance(estimated_time, datetime):
         raise BadgeRejected
@@ -195,7 +195,7 @@ def record_device_attempt(device_id, now=None, limit=60):
 
 def rfc6238_code(secret, unix_seconds, digits=8, step=30, hash_name='sha1'):
     """RFC 6238 Appendix B calculation, kept as an independent test oracle."""
-    counter = counter_for_time(unix_seconds) if step == 30 else int(unix_seconds // step)
+    counter = int(unix_seconds // step)
     digest = hmac.new(secret, struct.pack('>Q', counter), getattr(hashlib, hash_name)).digest()
     offset = digest[-1] & 0x0F
     binary = struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7FFFFFFF

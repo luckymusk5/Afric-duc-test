@@ -28,7 +28,7 @@ Lancer les conteneurs :
 docker compose up --build
 ```
 
-L’interface est sur http://localhost:5173 et l’API sur http://localhost:8000/api. Le conteneur backend applique les migrations et exécute `seed_demo`; le conteneur `scheduler` clôture les fenêtres avec le délai `PASSAGE_GRACE_MINUTES`.
+L’interface est sur http://localhost:5173 et l’API sur http://localhost:8000/api. Le conteneur backend applique les migrations et configure le lecteur QR PostgreSQL; le conteneur `scheduler` clôture les fenêtres avec le délai `PASSAGE_GRACE_MINUTES`. Les données de démonstration ne sont pas créées automatiquement.
 
 Pour lancer le frontend sans Docker : `Set-Location frontend; npm ci; npm run dev`. Pour le backend seul, renseigner `POSTGRES_HOST=localhost`, puis lancer `python manage.py migrate`, `python manage.py seed_demo` et `python manage.py runserver` dans `backend`.
 
@@ -134,9 +134,9 @@ python manage.py rebuild_journal 2026-11-25
 ## Vérifications
 
 ```powershell
-python manage.py test passage
+pytest
 python manage.py makemigrations passage --check --dry-run --noinput
 Set-Location frontend; npm run build
 ```
 
-La GitHub Action démarre PostgreSQL, vérifie les migrations et lance les tests de sécurité prioritaires du QR élève.
+La GitHub Action démarre PostgreSQL, vérifie les migrations, lance les tests backend et construit le frontend. Les tests prioritaires de synchronisation contrôlent les renvois répétés, les lots partiels, les accusés initiaux, le rollback atomique, l’autorité du terminal, les rôles, l’horloge et les écritures concurrentes.
